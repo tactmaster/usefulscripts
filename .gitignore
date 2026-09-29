@@ -1,0 +1,8 @@
+# Credentials
+.env
+
+# Python test tooling
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
