@@ -1,7 +1,7 @@
 # Mender scripts
 
-`lmdb-dump.py` works on a file you already have and needs no server access --
-skip to [lmdb-dump.py](#lmdb-dumppy) for that one.
+`lmdb-dump.py` and `lmdb-dump.sh` work on a file you already have and need no
+server access -- skip to [lmdb-dump.py](#lmdb-dumppy) for those.
 
 The remaining scripts talk to the [Mender](https://mender.io) management API.
 Set your server and a personal access token (Mender UI: Settings, then
@@ -99,6 +99,26 @@ anywhere python3 does -- no `lmdb` module, no LMDB command-line tools.
 
 Nothing in it is Mender-specific; it works on any single-file (`MDB_NOSUBDIR`)
 LMDB database.
+
+### lmdb-dump.sh
+
+The same reader in bash, for machines that have no python3 at all -- the usual
+case being the device itself, so you can read the store in place over ssh
+instead of copying it off first (still prefer a copy if the client is running;
+see above):
+
+```bash
+./mender/lmdb-dump.sh mender-store                # same output as the .py
+./mender/lmdb-dump.sh mender-store --stats-only
+```
+
+It needs bash (ash alone is not enough, but the other tools can be busybox
+applets) plus one of `od`, `xxd`, or `hexdump` -- whichever it finds -- and
+`dd`. JSON values are pretty-printed when `jq` or `python3` is available and
+printed as-is otherwise. The two scripts produce
+identical output and the test suite checks that they stay that way. The bash
+version is noticeably slower on large stores (hundreds of entries); for a
+typical `mender-store` with a dozen entries the difference doesn't matter.
 
 ### Stores from 32-bit devices
 

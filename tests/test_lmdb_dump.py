@@ -63,9 +63,10 @@ def _build_store(entries, wide=True, page_size=PAGE):
         blob = node + blob
         nodes.append(page_size - len(blob))
 
+    # page header: pgno, pad, flags, lower, upper -- exactly hdr bytes
     leaf = struct.pack(pgno, 2)
-    leaf += struct.pack("<HHH", P_LEAF, hdr + 2 * len(nodes), min(nodes))
-    leaf = leaf[:hdr].ljust(hdr, b"\x00")
+    leaf += struct.pack("<HHHH", 0, P_LEAF, hdr + 2 * len(nodes), min(nodes))
+    assert len(leaf) == hdr
     leaf += b"".join(struct.pack("<H", off) for off in nodes)
     leaf = leaf.ljust(page_size - len(blob), b"\x00") + blob
 
