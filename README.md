@@ -8,6 +8,7 @@ runs.
 |---|---|---|
 | [mender/set_device_name_from_attribute.sh](mender/set_device_name_from_attribute.sh) | Sets each Mender device's name from an attribute of your choice, such as its serial number or MAC address. Prints every API call as a curl command you can copy. | bash, curl, jq |
 | [mender/lmdb-dump.py](mender/lmdb-dump.py) | Prints the contents of a single-file LMDB database, such as Mender's `mender-store`. Reads stores written by 32-bit devices, which the standard `mdb_dump` rejects as `MDB_INVALID` on a 64-bit machine. | python3 (standard library only) |
+| [mender/lmdb-dump.sh](mender/lmdb-dump.sh) | The same LMDB reader in bash, for machines without python3 -- e.g. run it on the device itself over ssh. | bash, od/xxd/hexdump, dd |
 
 See [mender/README.md](mender/README.md) for usage.
 
