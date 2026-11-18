@@ -9,7 +9,7 @@ runs.
 | [mender/set_device_name_from_attribute.sh](mender/set_device_name_from_attribute.sh) | Sets each Mender device's name from an attribute of your choice, such as its serial number or MAC address. Prints every API call as a curl command you can copy. | bash, curl, jq |
 | [mender/lmdb-dump.py](mender/lmdb-dump.py) | Prints the contents of a single-file LMDB database, such as Mender's `mender-store`. Reads stores written by 32-bit devices, which the standard `mdb_dump` rejects as `MDB_INVALID` on a 64-bit machine. | python3 (standard library only) |
 | [mender/lmdb-dump.sh](mender/lmdb-dump.sh) | The same LMDB reader in bash, for machines without python3 -- e.g. run it on the device itself over ssh. | bash, od/xxd/hexdump, dd |
-| [mender/mender-check.sh](mender/mender-check.sh) | Checks a device's Mender client install: data store location and symlinks, `mender-store`, `device_type`, configuration, A/B partitions, bootloader environment, services and server reachability. Runs on the device or against a mounted image. | POSIX sh (busybox is fine) |
+| [mender/mender-check.sh](mender/mender-check.sh) | Checks a device's Mender client install: data store location and symlinks, `mender-store`, `device_type`, configuration and tenant token, inventory scripts and items, mender-connect / mender-configure / mender-monitor, A/B partitions, bootloader environment, services, authentication and server reachability. Runs on the device or against a mounted image. | POSIX sh (busybox is fine) |
 
 See [mender/README.md](mender/README.md) for usage.
 

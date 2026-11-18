@@ -2,8 +2,10 @@
 #
 # Check that a device's Mender client install is healthy: the data store is
 # where the client looks for it, the symlinks resolve, the configuration
-# parses and makes sense, and (on a live device) the bootloader, services and
-# server agree with it.
+# parses and makes sense, the inventory and identity scripts work, the
+# add-ons (mender-connect, mender-configure, mender-monitor) are set up, and
+# (on a live device) the bootloader, services, authentication and server
+# agree with it.
 #
 # POSIX sh, so it runs on busybox devices. Uses jq or python3 for a strict
 # JSON check if either is present, but does not need them.
@@ -12,6 +14,7 @@
 #   ./mender-check.sh                 # on the device, as root
 #   ./mender-check.sh --root /mnt     # a mounted image or extracted rootfs
 #   ./mender-check.sh --no-network    # skip the server reachability check
+#   ./mender-check.sh --inventory serial_number   # require an inventory item
 #
 # Exit status: 0 if nothing failed (warnings allowed), 1 if any check
 # failed, 2 for a usage error.
@@ -20,16 +23,22 @@ set -u
 
 usage() {
     cat <<'EOF'
-usage: mender-check.sh [--root DIR] [--no-network]
+usage: mender-check.sh [--root DIR] [--no-network] [--no-scripts]
+                       [--inventory KEY]...
 
 Checks a Mender client install and prints OK / WARN / FAIL per check.
 
-  --root DIR     check the filesystem mounted at DIR (an image or extracted
-                 rootfs) instead of the running system. Checks that need the
-                 live system -- mounts, bootloader environment, services,
-                 identity script output, server -- are skipped.
-  --no-network   don't try to reach the Mender server
-  -h, --help     show this help
+  --root DIR       check the filesystem mounted at DIR (an image or extracted
+                   rootfs) instead of the running system. Checks that need the
+                   live system -- mounts, bootloader environment, services,
+                   running the identity and inventory scripts, authentication,
+                   server -- are skipped.
+  --no-network     don't try to reach the Mender server
+  --no-scripts     don't run the identity and inventory scripts (running them
+                   is what the client does on every inventory update)
+  --inventory KEY  fail unless the inventory or identity scripts report the
+                   attribute KEY, e.g. serial_number; repeat for several
+  -h, --help       show this help
 
 Paths follow the client's own defaults and environment overrides:
 MENDER_CONF_DIR (/etc/mender), MENDER_DATASTORE_DIR (/var/lib/mender) and
@@ -39,10 +48,19 @@ Exit status: 0 if nothing failed, 1 if any check failed, 2 on usage error.
 EOF
 }
 
+NL='
+'
 ROOT=
 NETWORK=1
+RUN_SCRIPTS=1
+EXPECT_KEYS=
 while [ $# -gt 0 ]; do
     case $1 in
+        --inventory)
+            [ $# -ge 2 ] || { echo "--inventory needs an attribute name" >&2; exit 2; }
+            EXPECT_KEYS=${EXPECT_KEYS:+$EXPECT_KEYS$NL}$2; shift ;;
+        --inventory=*) EXPECT_KEYS=${EXPECT_KEYS:+$EXPECT_KEYS$NL}${1#--inventory=} ;;
+        --no-scripts) RUN_SCRIPTS=0 ;;
         --root)
             [ $# -ge 2 ] || { echo "--root needs a directory" >&2; exit 2; }
             ROOT=${2%/}; shift ;;
@@ -246,40 +264,100 @@ UpdatePollIntervalSeconds:n
 BootUtilitiesGetNextActivePart:s BootUtilitiesSetActivePart:s
 ClientProtocol:s Connectivity:o DBus:o'
 
-check_conf_keys() {  # check_conf_keys FILE FLAT
-    local key t want entry lower match
-    for key in $(printf '%s\n' "$2" | awk -F "$TAB" '$1 !~ /\./ { print $1 }'); do
-        t=$(lookup "$2" "$key"); t=${t%%"$TAB"*}
-        want=
-        for entry in $KNOWN_KEYS; do
-            [ "${entry%:*}" = "$key" ] && { want=${entry#*:}; break; }
-        done
+# check_keys FILE FLAT KNOWN DEPRECATED PROG MODE: report top-level keys
+# PROG doesn't read or reads with the wrong type. MODE "exact" is the C++
+# client: keys are case-sensitive and a wrongly typed value is silently
+# ignored. MODE "go" is Go's encoding/json (3.x client, mender-connect): keys
+# match case-insensitively and a wrongly typed value stops the program.
+check_keys() {
+    local file=$1 flat=$2 known=$3 deprecated=$4 prog=$5 mode=$6
+    local key t res want match
+    for key in $(printf '%s\n' "$flat" | awk -F "$TAB" '$1 !~ /\./ { print $1 }'); do
+        t=$(lookup "$flat" "$key"); t=${t%%"$TAB"*}
+        res=$(printf '%s\n' $known | awk -F: -v k="$key" -v go=$([ "$mode" = go ] && echo 1 || echo 0) '
+            $1 == k { print $2, $1; found = 1; exit }
+            tolower($1) == tolower(k) { m = $1; mt = $2 }
+            END { if (!found && m != "") print (go ? mt : "-"), m }')
+        want=${res%% *} match=${res#* }
+        [ "$want" = - ] && want=
         if [ -z "$want" ]; then
-            lower=$(printf '%s' "$key" | tr 'A-Z' 'a-z')
-            match=
-            for entry in $KNOWN_KEYS; do
-                if [ "$(printf '%s' "${entry%:*}" | tr 'A-Z' 'a-z')" = "$lower" ]; then
-                    match=${entry%:*}
-                fi
-            done
-            if [ -n "$match" ] && [ "$CLIENT_MAJOR" = 3 ]; then
-                :  # the 3.x Go client matched keys case-insensitively
+            if [ -n "$deprecated" ] && printf '%s\n' $deprecated | grep -qix -- "$key"; then
+                warn "$file: $prog ignores \"$key\" (deprecated; it uses the client's server settings)"
             elif [ -n "$match" ]; then
-                warn "$1: \"$key\" is ignored -- keys are case-sensitive; did you mean \"$match\"?"
+                warn "$file: \"$key\" is ignored -- keys are case-sensitive; did you mean \"$match\"?"
             else
-                warn "$1: \"$key\" is not a setting the Mender client reads (typo?)"
+                warn "$file: \"$key\" is not a setting $prog reads (typo?)"
             fi
-        elif [ "$t" != "$want" ]; then
-            warn "$1: \"$key\" is a $(typename "$t"), but the client expects a $(typename "$want") and silently ignores it"
+        elif [ "$t" != "$want" ] && [ "$mode" = go ] && [ "$t" != z ]; then
+            fail "$file: \"$key\" is a $(typename "$t") but $prog expects a $(typename "$want"), so it refuses to start"
+            [ "$want" = n ] && [ "$t" = s ] && hint "write it without quotes, e.g. \"$key\": 1800"
+        elif [ "$t" != "$want" ] && [ "$mode" = exact ]; then
+            warn "$file: \"$key\" is a $(typename "$t"), but $prog expects a $(typename "$want") and silently ignores it"
             [ "$want" = n ] && [ "$t" = s ] && hint "write it without quotes, e.g. \"$key\": 1800"
         fi
     done
 }
 
-# load_conf PATH: report problems; on success the flattened file is in LOADED
+# lcpaths FLAT: the same, with lowercased paths (for case-insensitive lookup)
+lcpaths() {
+    printf '%s\n' "$1" | awk -F "$TAB" -v OFS="$TAB" 'NF { $1 = tolower($1); print }'
+}
+
+# jwt_claims TOKEN -> the decoded JWT payload, or nothing
+jwt_claims() {
+    local p
+    have base64 || return 0
+    p=${1#*.}; p=${p%%.*}
+    p=$(printf '%s' "$p" | tr '_-' '/+')
+    case $((${#p} % 4)) in 2) p="$p==" ;; 3) p="$p=" ;; esac
+    printf '%s' "$p" | base64 -d 2>/dev/null
+}
+
+# Tenant tokens issued now are 43 random base64url characters. Organizations
+# created earlier have JWTs with a "mender.tenant" claim. The server looks the
+# string up as-is, so both are valid. Never print the token itself.
+check_tenant_token() {
+    local tok=$1 claims
+    case $tok in
+        [Bb]earer*)
+            warn "TenantToken starts with \"Bearer\"; use only the token itself"
+            return ;;
+        *' '*|*"$TAB"*|*\\*)
+            warn "TenantToken contains spaces or line breaks; copy it again from the Mender UI"
+            return ;;
+    esac
+    if printf '%s' "$tok" | grep -Eq '^[A-Za-z0-9_-]{43}$'; then
+        ok "TenantToken set"
+    elif printf '%s' "$tok" | grep -Eq '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'; then
+        claims=$(jwt_claims "$tok")
+        case $claims in
+            *'"mender.user"'*)
+                fail "TenantToken is a user's access token (it has a mender.user claim), not the organization token"
+                hint "use TENANT_TOKEN from Settings > Organization, not JWT_TOKEN or a personal access token" ;;
+            *'"mender.device"'*)
+                fail "TenantToken is a device's auth token, not the organization token" ;;
+            *'"mender.tenant"'*|'')
+                ok "TenantToken set (older JWT format)" ;;
+            *)
+                warn "TenantToken is a JWT without a mender.tenant claim; is it the organization token?" ;;
+        esac
+    else
+        case $tok in
+            '<'*|*TENANT*|*'$'*|*[Yy][Oo][Uu][Rr]*|*[Cc][Hh][Aa][Nn][Gg][Ee]*)
+                warn "TenantToken looks like a placeholder, not a real token" ;;
+            *)
+                warn "TenantToken is ${#tok} characters and matches neither token format"
+                hint "expected 43 characters of A-Z, a-z, 0-9, - and _ (or, for older"
+                hint "organizations, a JWT); copy it again from Settings > Organization" ;;
+        esac
+    fi
+}
+
+# load_conf PATH [PROG]: report problems; on success the flattened file is in
+# LOADED. Sets CONF_UNREADABLE=1 if the file exists but can't be read.
 FLAT_MAIN= FLAT_FALLBACK= CONF_UNREADABLE=0
 load_conf() {
-    local path=$1 f flat bad
+    local path=$1 prog=${2:-the client} f flat bad
     f=$(rp "$path")
     [ -e "$f" ] || return 1
     if [ ! -r "$f" ]; then
@@ -291,7 +369,7 @@ load_conf() {
     bad=$(printf '%s\n' "$flat" | sed -n "s/^!$TAB//p")
     if [ -n "$bad" ]; then
         fail "$path: not valid JSON: $bad"
-        hint "the client refuses to start with a broken config file"
+        hint "$prog refuses to start with a broken config file"
         return 1
     fi
     if have jq; then
@@ -357,22 +435,88 @@ resolve_part() {
 # mount_of PATH -> "device mountpoint"
 mount_of() { df -P "$1" 2>/dev/null | awk 'NR == 2 { print $1, $NF }'; }
 
-# exec_dir_check DIR WHAT [SKIP]: warn about non-executable files; COUNT and NAMES
-# describe the usable (executable) ones
+# exec_dir_check DIR WHAT [SKIP] [LEVEL] [EFFECT]: report entries that can't
+# run -- broken symlinks, and files without the execute bit (reported with
+# LEVEL, warn by default). COUNT, NAMES and PATHS (real paths, one per line)
+# describe the usable ones.
 exec_dir_check() {
-    local f
-    COUNT=0 NAMES=
-    for f in "$(rp "$1")"/*; do
-        [ -f "$f" ] || continue
-        [ "${f##*/}" = "${3:-}" ] && continue
-        if [ -x "$f" ]; then
-            COUNT=$((COUNT + 1))
-            NAMES=${NAMES:+$NAMES, }${f##*/}
+    local dir f name real effect
+    COUNT=0 NAMES= PATHS=
+    dir=$(canon "$1") || return 0
+    [ -d "$ROOT$dir" ] || return 0
+    for f in "$ROOT$dir"/*; do
+        name=${f##*/}
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        [ "$name" = "${3:-}" ] && continue
+        real=$(rp "$dir/$name")
+        if [ ! -e "$real" ]; then
+            fail "$1/$name -> $(readlink "$f"), which does not exist (broken symlink)"
+        elif [ -d "$real" ]; then
+            continue
+        elif [ ! -x "$real" ]; then
+            effect=${5:-", so the client never runs this $2"}
+            ${4:-warn} "$1/$name: not executable$effect"
         else
-            warn "$1/${f##*/}: not executable, so the client can't run this $2"
+            COUNT=$((COUNT + 1))
+            NAMES=${NAMES:+$NAMES, }$name
+            PATHS=${PATHS:+$PATHS$NL}$real
         fi
     done
 }
+
+# check_service NAME [HINT] [enabled]: running and enabled on a device,
+# enabled in an image. With "enabled", only check it is enabled (oneshots).
+check_service() {
+    local svc=$1 en ac w found=
+    if [ $LIVE = 1 ]; then
+        if ! have systemctl; then
+            [ -n "${SAID_NO_SYSTEMD:-}" ] || info "no systemctl; service state not checked"
+            SAID_NO_SYSTEMD=1
+            return 0
+        fi
+        en=$(systemctl is-enabled "$svc" 2>/dev/null)
+        ac=$(systemctl is-active "$svc" 2>/dev/null)
+        if [ "${3:-}" = enabled ]; then
+            if [ "$en" = enabled ]; then ok "$svc.service is enabled"
+            else warn "$svc.service is ${en:-not installed}${2:+; $2}"; fi
+        elif [ "$ac" = active ]; then
+            ok "$svc.service is running${en:+ ($en)}"
+        else
+            warn "$svc.service is ${ac:-unknown} (enabled: ${en:-unknown})"
+            hint "${2:+$2; }to see why: journalctl -u $svc"
+        fi
+    else
+        for w in "$ROOT"/etc/systemd/system/*.wants/"$svc".service \
+                 "$ROOT"/lib/systemd/system/*.wants/"$svc".service \
+                 "$ROOT"/usr/lib/systemd/system/*.wants/"$svc".service; do
+            if [ -e "$w" ] || [ -L "$w" ]; then found=1; break; fi
+        done
+        if [ -n "$found" ]; then
+            ok "$svc.service is enabled"
+        elif [ -d "$ROOT/etc/systemd" ]; then
+            warn "$svc.service is not enabled, so it won't start at boot${2:+; $2}"
+        fi
+    fi
+}
+
+# run_limited SECONDS CMD...: run with a time limit if timeout(1) works
+run_limited() {
+    local secs=$1
+    shift
+    if [ -z "${TIMEOUT_STYLE:-}" ]; then
+        if timeout 5 true 2>/dev/null; then TIMEOUT_STYLE=plain
+        elif timeout -t 5 true 2>/dev/null; then TIMEOUT_STYLE=dash_t
+        else TIMEOUT_STYLE=none; fi
+    fi
+    case $TIMEOUT_STYLE in
+        plain) timeout "$secs" "$@" ;;
+        dash_t) timeout -t "$secs" "$@" ;;
+        *) "$@" ;;
+    esac
+}
+
+# Files named key=value, one per line, joined: "k1=v1, k2=v2"
+kv_join() { printf '%s\n' "$1" | awk 'NF { printf "%s%s", (n++ ? ", " : ""), $0 } END { print "" }'; }
 
 printf 'Mender client check'
 if [ $LIVE = 1 ]; then
@@ -416,43 +560,23 @@ case $CLIENT_MAJOR in
     *) SERVICES= ;;
 esac
 for svc in $SERVICES; do
-    if [ $LIVE = 1 ]; then
-        have systemctl || { info "no systemctl; service state not checked"; break; }
-        en=$(systemctl is-enabled "$svc" 2>/dev/null)
-        ac=$(systemctl is-active "$svc" 2>/dev/null)
-        if [ "$ac" = active ]; then
-            ok "$svc.service is running (${en:-unknown})"
-        else
-            warn "$svc.service is ${ac:-unknown} (enabled: ${en:-unknown})"
-            hint "fine for standalone updates only; to check: journalctl -u $svc"
-        fi
-    else
-        found=
-        for w in "$ROOT"/etc/systemd/system/*.wants/"$svc".service \
-                 "$ROOT"/lib/systemd/system/*.wants/"$svc".service \
-                 "$ROOT"/usr/lib/systemd/system/*.wants/"$svc".service; do
-            [ -e "$w" ] || [ -L "$w" ] && { found=1; break; }
-        done
-        if [ -n "$found" ]; then
-            ok "$svc.service is enabled"
-        elif [ -d "$ROOT/etc/systemd" ]; then
-            warn "$svc.service is not enabled, so it won't start at boot"
-        fi
-    fi
+    check_service "$svc" "fine for standalone updates only"
 done
 
 # ---------------------------------------------------------------- config
 section "Configuration"
+CONF_MODE=exact
+[ "$CLIENT_MAJOR" = 3 ] && CONF_MODE=go
 nkeys() { printf '%s\n' "$1" | awk -F "$TAB" 'NF && $1 !~ /\./' | wc -l | tr -d ' '; }
 if load_conf "$CONF_MAIN"; then
     FLAT_MAIN=$LOADED
     ok "$CONF_MAIN: valid JSON, $(nkeys "$FLAT_MAIN") settings"
-    check_conf_keys "$CONF_MAIN" "$FLAT_MAIN"
+    check_keys "$CONF_MAIN" "$FLAT_MAIN" "$KNOWN_KEYS" "" "the client" "$CONF_MODE"
 fi
 if load_conf "$CONF_FALLBACK"; then
     FLAT_FALLBACK=$LOADED
     ok "$CONF_FALLBACK: valid JSON, $(nkeys "$FLAT_FALLBACK") settings (overridden by $CONF_MAIN)"
-    check_conf_keys "$CONF_FALLBACK" "$FLAT_FALLBACK"
+    check_keys "$CONF_FALLBACK" "$FLAT_FALLBACK" "$KNOWN_KEYS" "" "the client" "$CONF_MODE"
 fi
 if [ ! -e "$(rp "$CONF_MAIN")" ] && [ ! -e "$(rp "$CONF_FALLBACK")" ]; then
     fail "no configuration: neither $CONF_MAIN nor $CONF_FALLBACK exists"
@@ -498,7 +622,7 @@ else
             fi ;;
         docker.mender.io) info "$host is the demo server address" ;;
     esac
-    [ -n "$TOKEN" ] && ok "TenantToken set"
+    [ -n "$TOKEN" ] && check_tenant_token "$TOKEN"
 fi
 
 # Referenced files
@@ -763,14 +887,15 @@ if [ $STORE_OK = 1 ]; then
 fi
 
 # ---------------------------------------------------------------- device files
-section "Identity, inventory and update modules"
+section "Identity, update modules and state scripts"
+ID_OUT=
 ID_SCRIPT=$DATA_DIR/identity/mender-device-identity
 if [ ! -f "$(rp "$ID_SCRIPT")" ]; then
     fail "$ID_SCRIPT is missing; the device can't identify itself to the server"
 elif [ ! -x "$(rp "$ID_SCRIPT")" ]; then
     fail "$ID_SCRIPT is not executable"
-elif [ $LIVE = 1 ]; then
-    id_out=$("$ID_SCRIPT" 2>/dev/null)
+elif [ $LIVE = 1 ] && [ $RUN_SCRIPTS = 1 ]; then
+    id_out=$(run_limited 60 "$ID_SCRIPT" 2>/dev/null)
     id_rc=$?
     id_kv=$(printf '%s\n' "$id_out" | grep -c '^[^=][^=]*=..*')
     if [ $id_rc -ne 0 ]; then
@@ -778,17 +903,11 @@ elif [ $LIVE = 1 ]; then
     elif [ "$id_kv" -eq 0 ]; then
         fail "$ID_SCRIPT printed no key=value lines"
     else
-        ok "identity: $(printf '%s\n' "$id_out" | grep '=' | tr '\n' ' ' | sed 's/ $//')"
+        ok "identity: $(kv_join "$id_out")"
+        ID_OUT=$id_out
     fi
 else
     ok "$ID_SCRIPT present"
-fi
-
-exec_dir_check "$DATA_DIR/inventory" "inventory script"
-if [ "$COUNT" -eq 0 ]; then
-    warn "no usable inventory scripts in $DATA_DIR/inventory; the server will show no inventory"
-else
-    ok "$COUNT inventory script(s)"
 fi
 
 exec_dir_check "$DATA_DIR/modules/v3" "update module"
@@ -829,6 +948,287 @@ if [ $LIVE = 1 ] && [ $IS_ROOT = 1 ] && [ -n "$CLIENT_BIN" ]; then
         hint "depend on the current artifact name won't match until the first full update"
     elif [ -n "$cur" ]; then
         ok "installed artifact: $cur"
+    fi
+fi
+
+# ---------------------------------------------------------------- inventory
+section "Inventory"
+INV_DIR=$DATA_DIR/inventory
+INV_RAN=0 INV_DATA=
+exec_dir_check "$INV_DIR" "inventory script"
+INV_PATHS=
+for p in $(printf '%s\n' "$PATHS" | awk 'NF'); do
+    case ${p##*/} in
+        mender-inventory-*) INV_PATHS=${INV_PATHS:+$INV_PATHS$NL}$p ;;
+        *) warn "$INV_DIR/${p##*/}: skipped by the client; inventory scripts must be named mender-inventory-*" ;;
+    esac
+done
+n_inv=$(printf '%s\n' "$INV_PATHS" | awk 'NF' | wc -l | tr -d ' ')
+if [ "$n_inv" -eq 0 ]; then
+    warn "no usable inventory scripts in $INV_DIR; the server will show no inventory"
+elif [ $LIVE = 0 ] || [ $RUN_SCRIPTS = 0 ]; then
+    ok "$n_inv inventory script(s) (not run)"
+elif [ $IS_ROOT = 0 ]; then
+    ok "$n_inv inventory script(s)"
+    info "not run: the client runs them as root, so run this check as root to test them"
+else
+    INV_RAN=1 good=0
+    for p in $(printf '%s\n' "$INV_PATHS"); do
+        name=${p##*/}
+        out=$(run_limited 60 "$p" 2>/dev/null)
+        rc=$?
+        if [ $rc -eq 124 ] || [ $rc -eq 143 ]; then
+            fail "$name didn't finish within 60 seconds"
+            continue
+        elif [ $rc -ne 0 ]; then
+            fail "$name exited with status $rc, so the client drops its output"
+            continue
+        fi
+        bad=$(printf '%s\n' "$out" | awk '!/=/ { printf "line %d: \"%s\"", NR, $0; exit }')
+        if [ -n "$out" ] && [ -n "$bad" ]; then
+            fail "$name printed a line without \"=\" ($bad)"
+            hint "the client logs an error and drops everything from that line on;"
+            hint "every line must be key=value, and blank lines count too"
+            INV_DATA=$INV_DATA$NL$(printf '%s\n' "$out" | awk '!/=/ { exit } { print }')
+            continue
+        fi
+        good=$((good + 1))
+        INV_DATA=$INV_DATA$NL$out
+    done
+    n_attr=$(printf '%s\n' "$INV_DATA" | awk -F= 'NF > 1 && !seen[$1]++' | wc -l | tr -d ' ')
+    [ $good -gt 0 ] && ok "$good of $n_inv inventory script(s) ran cleanly, reporting $n_attr attribute(s)"
+fi
+
+# --inventory KEY: the attribute must come from a script (or the client)
+for key in $(printf '%s\n' "$EXPECT_KEYS"); do
+    vals=$(printf '%s\n' "$INV_DATA" | awk -v k="$key" '
+        index($0, k "=") == 1 { v = v (n++ ? ", " : "") substr($0, length(k) + 2) }
+        END { if (n) print v; exit !n }')
+    found=$?
+    idv=$(printf '%s\n' "$ID_OUT" | awk -v k="$key" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }')
+    if [ $found -eq 0 ]; then
+        ok "inventory: $key=$vals"
+    elif [ -n "$idv" ]; then
+        ok "$key=$idv (an identity attribute, not inventory)"
+    else
+        case $key in
+            mender_client_version|mender_client_version_provider)
+                ok "$key is added by the client itself" ;;
+            artifact_name|device_type)
+                info "$key is reported through the client's deployment checks, not by inventory scripts" ;;
+            *)
+                if [ $INV_RAN = 0 ]; then
+                    info "\"$key\" not checked: the inventory scripts were not run"
+                else
+                    fail "no inventory script reports \"$key\""
+                    keys=$(printf '%s\n' "$INV_DATA" | awk -F= 'NF > 1 && !seen[$1]++ { print $1 }' | head -n 12 | tr '\n' ' ')
+                    [ -n "$keys" ] && hint "the scripts report: $keys..."
+                fi ;;
+        esac
+    fi
+done
+
+# ---------------------------------------------------------------- add-ons
+section "Add-ons"
+ADDONS=0
+
+# mender-connect: remote terminal, file transfer, port forwarding
+CONNECT_KEYS='ShellCommand:s ShellArguments:a User:s Terminal:o Sessions:o
+Limits:o ReconnectIntervalSeconds:n FileTransfer:o PortForward:o MenderClient:o'
+CONNECT_DEPRECATED='ServerURL Servers ClientProtocol HttpsClient SkipVerify ServerCertificate'
+CONNECT_CONF=$CONF_DIR/mender-connect.conf
+CONNECT_FALLBACK=$STORE_DIR/mender-connect.conf
+CONNECT_BIN=$(find_bin mender-connect)
+if [ -n "$CONNECT_BIN" ]; then
+    ADDONS=$((ADDONS + 1))
+    v=
+    [ $LIVE = 1 ] && v=$("$CONNECT_BIN" --version 2>/dev/null | head -n 1)
+    ok "mender-connect installed ($CONNECT_BIN${v:+, $v})"
+    check_service mender-connect "remote terminal, file transfer and port forwarding are unavailable"
+    CONF_UNREADABLE=0 CF_MAIN= CF_FALLBACK=
+    if load_conf "$CONNECT_CONF" mender-connect; then
+        CF_MAIN=$(lcpaths "$LOADED")
+        ok "$CONNECT_CONF: valid JSON"
+        check_keys "$CONNECT_CONF" "$LOADED" "$CONNECT_KEYS" "$CONNECT_DEPRECATED" mender-connect go
+    fi
+    if load_conf "$CONNECT_FALLBACK" mender-connect; then
+        CF_FALLBACK=$(lcpaths "$LOADED")
+        ok "$CONNECT_FALLBACK: valid JSON (overridden by $CONNECT_CONF)"
+        check_keys "$CONNECT_FALLBACK" "$LOADED" "$CONNECT_KEYS" "$CONNECT_DEPRECATED" mender-connect go
+    fi
+    # cv KEY: effective mender-connect value (keys lowercase) -> V
+    cv() {
+        local hit
+        hit=$(lookup "$CF_MAIN" "$1")
+        [ -n "$hit" ] || hit=$(lookup "$CF_FALLBACK" "$1")
+        [ -n "$hit" ] || return 1
+        V=${hit#*"$TAB"}
+    }
+    if [ $CONF_UNREADABLE = 1 ]; then
+        info "mender-connect settings not checked (configuration not readable)"
+    else
+        c_ok=1
+        if cv user && [ -n "$V" ]; then
+            c_user=$V
+            if [ $LIVE = 1 ]; then
+                id "$c_user" >/dev/null 2>&1 || c_user_missing=1
+            else
+                grep -q "^$c_user:" "$(rp /etc/passwd)" 2>/dev/null || c_user_missing=1
+            fi
+            if [ -n "${c_user_missing:-}" ]; then
+                fail "mender-connect: User \"$c_user\" doesn't exist on this device, so it refuses to start"
+                c_ok=0
+            fi
+        else
+            fail "mender-connect: no \"User\" set, so it refuses to start"
+            hint "add e.g. \"User\": \"root\" to $CONNECT_CONF"
+            c_ok=0 c_user=
+        fi
+        c_shell=/bin/sh
+        cv shellcommand && [ -n "$V" ] && c_shell=$V
+        case $c_shell in
+            /*)
+                if [ ! -x "$(rp "$c_shell")" ]; then
+                    fail "mender-connect: ShellCommand $c_shell is missing or not executable"
+                    c_ok=0
+                elif [ -f "$(rp /etc/shells)" ]; then
+                    if ! grep -qx -- "$c_shell" "$(rp /etc/shells)"; then
+                        fail "mender-connect: ShellCommand $c_shell is not listed in /etc/shells, so it refuses to start"
+                        c_ok=0
+                    fi
+                elif [ "$c_shell" != /bin/sh ]; then
+                    fail "mender-connect: there is no /etc/shells, so only /bin/sh is accepted as ShellCommand"
+                    c_ok=0
+                fi ;;
+            *) fail "mender-connect: ShellCommand \"$c_shell\" must be an absolute path"; c_ok=0 ;;
+        esac
+        [ $c_ok = 1 ] && ok "mender-connect: shell $c_shell as user $c_user"
+        off=
+        for f in terminal.disable:"remote terminal" filetransfer.disable:"file transfer" \
+                portforward.disable:"port forwarding" menderclient.disable:"client control"; do
+            cv "${f%%:*}" && [ "$V" = true ] && off=${off:+$off, }${f#*:}
+        done
+        [ -n "$off" ] && info "mender-connect: disabled in its configuration: $off"
+    fi
+elif [ -e "$(rp "$CONNECT_CONF")" ]; then
+    warn "$CONNECT_CONF exists but mender-connect is not installed"
+else
+    info "mender-connect not installed"
+fi
+
+# mender-configure: device configuration from the server
+CFG_MODULE=$DATA_DIR/modules/v3/mender-configure
+CFG_APPLY=/usr/lib/mender-configure/apply-device-config.d
+CFG_FILE=/var/lib/mender-configure/device-config.json
+if [ -e "$(rp "$CFG_MODULE")" ]; then
+    ADDONS=$((ADDONS + 1))
+    ok "mender-configure installed ($CFG_MODULE)"
+    if [ -x "$(rp "$INV_DIR/mender-inventory-mender-configure")" ]; then
+        ok "mender-configure reports the device's configuration (mender-inventory-mender-configure)"
+    else
+        warn "mender-configure: $INV_DIR/mender-inventory-mender-configure is missing or not executable"
+        hint "the server won't see the configuration the device actually has"
+    fi
+    exec_dir_check "$CFG_APPLY" "apply script" "" fail ", so every configuration deployment fails"
+    if [ "$COUNT" -eq 0 ]; then
+        warn "mender-configure: no apply scripts in $CFG_APPLY"
+        hint "configuration from the server is saved, but nothing applies it"
+    else
+        ok "mender-configure apply scripts: $NAMES"
+    fi
+    for t in dbus-send curl sha256sum; do
+        [ -n "$(find_bin "$t")" ] || fail "mender-configure needs $t to report the configuration, and it is not installed"
+    done
+    cf=$(rp "$CFG_FILE")
+    if [ ! -e "$cf" ]; then
+        info "mender-configure: no configuration deployed yet ($CFG_FILE)"
+    elif [ ! -r "$cf" ]; then
+        info "mender-configure: $CFG_FILE present (not readable without root)"
+    else
+        flat=$(flatten "$cf")
+        bad=$(printf '%s\n' "$flat" | sed -n "s/^!$TAB//p")
+        if [ -n "$bad" ]; then
+            fail "mender-configure: $CFG_FILE is not valid JSON: $bad"
+        else
+            ok "mender-configure: current configuration has $(nkeys "$flat") setting(s)"
+        fi
+    fi
+    check_service mender-configure-apply-device-config "the configuration isn't re-applied at boot" enabled
+elif [ -d "$(rp "$CFG_APPLY")" ]; then
+    warn "$CFG_APPLY exists but the mender-configure update module ($CFG_MODULE) is missing"
+else
+    info "mender-configure not installed"
+fi
+
+# mender-monitor: alerts from monitors in /etc/mender-monitor/monitor.d
+MON_SHARE=/usr/share/mender-monitor
+MON_D=/etc/mender-monitor/monitor.d
+if [ -d "$(rp "$MON_SHARE")" ] || [ -n "$(find_bin mender-monitord)" ]; then
+    ADDONS=$((ADDONS + 1))
+    m_ok=1
+    for b in mender-monitord mender-monitorctl; do
+        link=$(canon /usr/bin)/$b
+        if [ -L "$ROOT$link" ] && [ ! -e "$(rp "/usr/bin/$b")" ]; then
+            fail "/usr/bin/$b -> $(readlink "$ROOT$link"), which does not exist (broken symlink)"
+            m_ok=0
+        elif [ ! -e "$(rp "/usr/bin/$b")" ]; then
+            fail "mender-monitor: /usr/bin/$b is missing"
+            m_ok=0
+        fi
+    done
+    m_ver=$(cat "$(rp "$MON_SHARE/.version")" 2>/dev/null)
+    [ $m_ok = 1 ] && ok "mender-monitor installed${m_ver:+ (version $m_ver)}"
+    [ -n "$(find_bin bash)" ] || fail "mender-monitor is written in bash, which is not installed"
+    [ -n "$(find_bin dbus-send)" ] || fail "mender-monitor needs dbus-send to send alerts, and it is not installed"
+    check_service mender-monitor "no alerts are sent"
+    for d in enabled available; do
+        [ -d "$(rp "$MON_D/$d")" ] || warn "mender-monitor: $MON_D/$d is missing"
+    done
+    m_n=0 m_names=
+    for f in "$(rp "$MON_D/enabled")"/*; do
+        name=${f##*/}
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        case $name in
+            *.sh) ;;
+            *) warn "$MON_D/enabled/$name: ignored; enabled monitors must end in .sh"; continue ;;
+        esac
+        if [ ! -e "$(rp "$MON_D/enabled/$name")" ]; then
+            fail "$MON_D/enabled/$name -> $(readlink "$f"), which does not exist (broken symlink)"
+            continue
+        fi
+        case $name in
+            *_*) sub=${name%%_*} ;;
+            *) fail "$MON_D/enabled/$name: monitors must be named <subsystem>_<name>.sh"; continue ;;
+        esac
+        if [ ! -f "$(rp "$MON_D/$sub.sh")" ]; then
+            fail "$MON_D/enabled/$name: there is no $MON_D/$sub.sh to handle the \"$sub\" subsystem"
+            continue
+        fi
+        m_n=$((m_n + 1))
+        m_names=${m_names:+$m_names, }${name%.sh}
+    done
+    if [ $m_n -eq 0 ]; then
+        info "mender-monitor: no monitors enabled (mender-monitorctl enable ...)"
+    else
+        ok "mender-monitor: $m_n monitor(s) enabled: $m_names"
+    fi
+elif [ -d "$(rp /etc/mender-monitor)" ]; then
+    warn "/etc/mender-monitor exists but mender-monitor is not installed"
+else
+    info "mender-monitor not installed"
+fi
+
+# The add-ons get the server URL and auth token from mender-authd over D-Bus.
+if [ $ADDONS -gt 0 ] && [ "$CLIENT_MAJOR" = 4 ]; then
+    policy=
+    for d in /usr/share/dbus-1/system.d /etc/dbus-1/system.d; do
+        [ -f "$(rp "$d/io.mender.AuthenticationManager.conf")" ] && policy=$d/io.mender.AuthenticationManager.conf
+    done
+    if [ -n "$policy" ]; then
+        ok "D-Bus policy for mender-auth present ($policy)"
+    else
+        fail "the D-Bus policy io.mender.AuthenticationManager.conf is missing"
+        hint "the add-ons get their server connection from mender-auth over D-Bus and can't without it"
     fi
 fi
 
@@ -903,6 +1303,33 @@ if [ $LIVE = 1 ] && [ $NETWORK = 1 ] && [ -n "$SERVER_URL" ]; then
         fi
     else
         info "no curl or wget; server reachability not checked"
+    fi
+fi
+
+# ---------------------------------------------------------------- auth
+if [ $LIVE = 1 ] && [ "$CLIENT_MAJOR" = 4 ]; then
+    section "Authentication"
+    if [ $IS_ROOT = 0 ]; then
+        info "not checked: run as root to ask mender-authd whether the device is authenticated"
+    elif ! have dbus-send; then
+        info "not checked: dbus-send is not installed"
+    else
+        reply=$(run_limited 15 dbus-send --system --print-reply \
+            --dest=io.mender.AuthenticationManager /io/mender/AuthenticationManager \
+            io.mender.Authentication1.GetJwtToken 2>&1)
+        rc=$?
+        strs=$(printf '%s\n' "$reply" | sed -ne 's/^ *string "\(.*\)" *$/\1/p')
+        auth_tok=$(printf '%s\n' "$strs" | sed -n 1p)
+        auth_srv=$(printf '%s\n' "$strs" | sed -n 2p)
+        if [ $rc -ne 0 ]; then
+            fail "can't ask mender-authd for the device's auth token: $(printf '%s\n' "$reply" | head -n 1)"
+            hint "is mender-authd.service running? journalctl -u mender-authd"
+        elif [ -z "$auth_tok" ]; then
+            warn "the device has no auth token: it isn't accepted on the server yet, or can't reach it"
+            hint "look for it under Devices > Pending in the Mender UI; journalctl -u mender-authd"
+        else
+            ok "the device is authenticated${auth_srv:+ with $auth_srv}"
+        fi
     fi
 fi
 

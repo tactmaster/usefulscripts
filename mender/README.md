@@ -84,6 +84,8 @@ ssh device sudo sh /tmp/mender-check.sh            # on the device, as root
 
 ./mender/mender-check.sh --root /mnt/rootfs        # a mounted image or rootfs
 ./mender/mender-check.sh --no-network              # skip the server check
+./mender/mender-check.sh --inventory serial_number # also require this inventory item
+./mender/mender-check.sh --no-scripts              # don't run identity/inventory scripts
 ```
 
 It is plain POSIX sh, so it runs on busybox devices; `jq` and `python3` are
@@ -96,16 +98,28 @@ What it checks:
 | Area | Checks |
 |---|---|
 | Client | `mender-update` + `mender-auth` (4.x and later) or `mender` (3.x) installed; services enabled and running |
-| Configuration | `/etc/mender/mender.conf` and the fallback `/var/lib/mender/mender.conf` are valid JSON; unknown keys and wrong-case keys (`ServerUrl`); values of the wrong type, which the client silently ignores (`"UpdatePollIntervalSeconds": "1800"`); `Servers` and `ServerURL` both set (the client refuses to start); ServerURL scheme; TenantToken present for hosted Mender; files named by `ServerCertificate`, `ArtifactVerifyKey(s)` and `HttpsClient` exist; `RootfsPartA`/`B` set, different, existing, and one of them is the running root |
+| Configuration | `/etc/mender/mender.conf` and the fallback `/var/lib/mender/mender.conf` are valid JSON; unknown keys and wrong-case keys (`ServerUrl`); values of the wrong type, which the client silently ignores (`"UpdatePollIntervalSeconds": "1800"`); `Servers` and `ServerURL` both set (the client refuses to start); ServerURL scheme; TenantToken present for hosted Mender and in a valid format (see below); files named by `ServerCertificate`, `ArtifactVerifyKey(s)` and `HttpsClient` exist; `RootfsPartA`/`B` set, different, existing, and one of them is the running root |
 | Data store | `/var/lib/mender` exists and its symlink resolves (normally to `/data/mender`); it is on a separate, writable partition, not the root filesystem that A/B updates replace; `/data` is mounted (fstab or `data.mount`); `mender-store` is an LMDB file written with the same word size as the client (a 32-bit store can't be opened by a 64-bit client); stray copies of `mender-store` in places the client never reads; `device_type` is exactly one `device_type=...` line; device key is a private key with mode 600 |
-| Device files | identity script exists, is executable and prints `key=value` lines; inventory scripts, update modules and state scripts are executable; state scripts have a `version` file; with no `mender-store` yet, a `bootstrap.mender` is there to set the artifact name (otherwise it becomes `unknown`); `artifact_info` only for the 3.x client, which is the only one that reads it |
+| Device files | identity script exists, is executable and prints `key=value` lines; update modules and state scripts are executable and their symlinks resolve; state scripts have a `version` file; with no `mender-store` yet, a `bootstrap.mender` is there to set the artifact name (otherwise it becomes `unknown`); `artifact_info` only for the 3.x client, which is the only one that reads it |
+| Inventory | scripts in `/usr/share/mender/inventory` are named `mender-inventory-*` (the client skips anything else), are executable, and their symlinks resolve (packages link them to `/etc/mender/inventory`); on a device, as root, each one is run like the client does: it must exit 0 and print only `key=value` lines -- a line without `=`, including a blank line, makes the client log an error and drop the rest; with `--inventory KEY`, KEY must be among the reported attributes |
+| Add-ons | **mender-connect**: service running; `mender-connect.conf` (and the fallback in `/var/lib/mender`) valid, with no wrongly typed values (it refuses to start) and no ignored, deprecated server settings; `User` set and present on the device; `ShellCommand` absolute, executable and listed in `/etc/shells`. **mender-configure**: inventory script present; apply scripts in `/usr/lib/mender-configure/apply-device-config.d` executable (one that isn't fails every configuration deployment); `dbus-send`, `curl` and `sha256sum` installed; `device-config.json` valid. **mender-monitor**: `/usr/bin/mender-monitord` and `mender-monitorctl` symlinks resolve; `bash` and `dbus-send` installed; service running; every monitor in `monitor.d/enabled` resolves, is named `<subsystem>_<name>.sh` and has its subsystem handler. With any add-on, the mender-auth D-Bus policy they need is installed |
 | Bootloader | `fw_printenv` (with `/etc/fw_env.config`) or GRUB tools present; `mender_boot_part` matches the partition the device is running from; `upgrade_available` (an uncommitted update); the bootloader can save its environment |
 | Server | the clock is sane (TLS fails otherwise); ServerURL is reachable |
+| Authentication | asks `mender-authd` over D-Bus whether the device has an auth token, i.e. has been accepted on the server (the token itself is never printed) |
 
 With `--root`, checks that need the running system (mounts, bootloader,
-service state, running the identity script, the server) are skipped. If
+service state, running the identity and inventory scripts, authentication, the
+server) are skipped. If
 `/var/lib/mender` points at a data partition that isn't part of the image, the
 store checks are skipped too.
+
+Tenant tokens come in two formats, and both are accepted. Organizations
+created now get 43 random characters (`A-Z`, `a-z`, `0-9`, `-`, `_`); older
+ones have a JWT with a `mender.tenant` claim. The check warns about tokens with
+spaces or line breaks, a `Bearer` prefix, placeholders, or the wrong length,
+and fails if the "token" is really a user's access token (a JWT with a
+`mender.user` claim -- the `JWT_TOKEN` from the install snippet rather than
+`TENANT_TOKEN`). The token is never printed.
 
 Paths follow the client's own defaults and its `MENDER_CONF_DIR`,
 `MENDER_DATASTORE_DIR` and `MENDER_DATA_DIR` overrides. To look inside the store
