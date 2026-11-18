@@ -59,7 +59,6 @@ def make_root(tmp_path, conf=GOOD_CONF, store_wide=True, client=ELF64):
     if conf is not None:
         _write(r, "/etc/mender/mender.conf",
                conf if isinstance(conf, str) else json.dumps(conf, indent=2))
-    _write(r, "/etc/mender/artifact_info", "artifact_name=release-1\n")
     _write(r, "/etc/fstab", "/dev/mmcblk0p4 /data auto defaults 0 0\n")
     (r / "var/lib").mkdir(parents=True)
     (r / "var/lib/mender").symlink_to("/data/mender")
@@ -292,3 +291,41 @@ def test_help_and_usage_errors(shell, tmp_path):
     r = subprocess.run([*shell, str(SCRIPT), "--root", str(tmp_path / "nope")],
                        capture_output=True, text=True)
     assert r.returncode == 2 and "not a directory" in r.stderr
+
+
+def test_tenant_token_format_is_not_second_guessed(shell, tmp_path):
+    conf = {**GOOD_CONF, "TenantToken": "opaque-token-without-dots"}
+    r = run(shell, make_root(tmp_path, conf=conf))
+    assert r.returncode == 0, r.stdout
+    assert lines(r, "WARN") == [], r.stdout
+    assert "TenantToken set" in r.stdout
+
+
+def test_artifact_info_not_needed_by_4x_client(shell, tmp_path):
+    root = make_root(tmp_path)
+    r = run(shell, root)
+    assert "/etc/mender/artifact_info" not in r.stdout
+    _write(root, "/etc/mender/artifact_info", "artifact_name=release-1\n")
+    r = run(shell, root)
+    assert lines(r, "WARN") == [], r.stdout
+    assert "left over from 3.x" in r.stdout
+
+
+def test_artifact_info_required_by_3x_client(shell, tmp_path):
+    root = make_root(tmp_path)
+    (root / "usr/bin/mender-update").rename(root / "usr/bin/mender")
+    (root / "usr/bin/mender-auth").unlink()
+    r = run(shell, root)
+    assert any("artifact_info is missing" in ln for ln in lines(r, "WARN"))
+
+
+def test_bootstrap_artifact_seeds_missing_store(shell, tmp_path):
+    root = make_root(tmp_path)
+    (root / "data/mender/mender-store").unlink()
+    r = run(shell, root)
+    assert any("no mender-store and no bootstrap.mender" in ln
+               for ln in lines(r, "WARN"))
+    _write(root, "/data/mender/bootstrap.mender", b"artifact")
+    r = run(shell, root)
+    assert lines(r, "WARN") == [], r.stdout
+    assert "bootstrap.mender will initialise it" in r.stdout

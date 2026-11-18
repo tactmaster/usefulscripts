@@ -498,12 +498,7 @@ else
             fi ;;
         docker.mender.io) info "$host is the demo server address" ;;
     esac
-    if [ -n "$TOKEN" ]; then
-        case $TOKEN in
-            *.*.*) ok "TenantToken set" ;;
-            *) warn "TenantToken \"$TOKEN\" doesn't look like a token (expected three dot-separated parts)" ;;
-        esac
-    fi
+    [ -n "$TOKEN" ] && ok "TenantToken set"
 fi
 
 # Referenced files
@@ -699,6 +694,13 @@ if [ $STORE_OK = 1 ]; then
     elif [ -e "$ROOT$STORE_FILE" ]; then
         fail "$STORE_FILE exists but is not a regular file"
         hint "the client uses a single-file LMDB store, not a directory"
+    elif [ "$CLIENT_MAJOR" != 3 ] && [ -f "$(rp "$STORE_DIR/bootstrap.mender")" ]; then
+        ok "no mender-store yet; $STORE_DIR/bootstrap.mender will initialise it on first start"
+    elif [ "$CLIENT_MAJOR" != 3 ]; then
+        warn "no mender-store and no bootstrap.mender in $STORE_REAL"
+        hint "on first start the client will record the artifact name as \"unknown\";"
+        hint "Yocto and mender-convert images ship bootstrap.mender to set it."
+        hint "If the client has run before, it has lost its state."
     else
         warn "no mender-store in $STORE_REAL"
         hint "normal before the client's first start; otherwise it has lost its state"
@@ -806,18 +808,28 @@ if [ "$COUNT" -gt 0 ]; then
     fi
 fi
 
-if [ -f "$(rp "$CONF_DIR/artifact_info")" ]; then
-    an=$(sed -n 's/^artifact_name=//p' "$(rp "$CONF_DIR/artifact_info")" | head -n 1)
-    if [ -n "$an" ]; then ok "artifact_info: $an"
-    else warn "$CONF_DIR/artifact_info has no artifact_name= line"; fi
-elif [ $AB = 1 ]; then
-    warn "$CONF_DIR/artifact_info is missing; images built by Yocto or mender-convert always have it"
-else
-    info "no $CONF_DIR/artifact_info (normal for a package install)"
+# The 3.x client took the artifact name from artifact_info; 4.x and later
+# keep it in mender-store, seeded from bootstrap.mender on first start.
+if [ "$CLIENT_MAJOR" = 3 ]; then
+    if [ -f "$(rp "$CONF_DIR/artifact_info")" ]; then
+        an=$(sed -n 's/^artifact_name=//p' "$(rp "$CONF_DIR/artifact_info")" | head -n 1)
+        if [ -n "$an" ]; then ok "artifact_info: $an"
+        else warn "$CONF_DIR/artifact_info has no artifact_name= line"; fi
+    else
+        warn "$CONF_DIR/artifact_info is missing; the 3.x client reads the artifact name from it"
+    fi
+elif [ -f "$(rp "$CONF_DIR/artifact_info")" ]; then
+    info "$CONF_DIR/artifact_info is left over from 3.x; this client reads the artifact name from mender-store"
 fi
 if [ $LIVE = 1 ] && [ $IS_ROOT = 1 ] && [ -n "$CLIENT_BIN" ]; then
     cur=$("$CLIENT_BIN" show-artifact 2>/dev/null | tail -n 1)
-    [ -n "$cur" ] && info "client reports the installed artifact as: $cur"
+    if [ "$cur" = unknown ]; then
+        warn "the client reports the installed artifact name as \"unknown\""
+        hint "the store was created without a bootstrap artifact; deployments that"
+        hint "depend on the current artifact name won't match until the first full update"
+    elif [ -n "$cur" ]; then
+        ok "installed artifact: $cur"
+    fi
 fi
 
 # ---------------------------------------------------------------- boot
