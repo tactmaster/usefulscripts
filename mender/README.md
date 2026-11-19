@@ -138,3 +138,53 @@ the layout and reads both.
 - dupsort / LEAF2 (dupfixed) databases are not supported; the script exits with
   an error rather than printing something that looks plausible but is wrong.
 - Sub-databases are listed as `<sub-database>` but not descended into.
+
+## mender-term-extract.py
+
+Turns a recorded remote terminal session into plain text. In the Mender UI, a
+terminal session in the audit log has a Download button that saves an HTML page
+(`terminalsession.html`) which replays the session in a browser. This script
+pulls the recorded output back out of that page, so you can read, search or
+diff it.
+
+```bash
+./mender/mender-term-extract.py out/ terminalsession.html
+./mender/mender-term-extract.py out/ AMGW1_1620.html AMGW1_1632.html \
+    --start AMGW1_1632=2026-11-10T16:32:05.120
+```
+
+It writes `out/NAME.txt` for each export, where NAME is the file name without
+`.html`. Each line is prefixed with its offset from the start of the
+recording:
+
+```text
+# source: terminalsession.html
+# title: Terminal playback
+# items: 5, recorded pauses: 1.750s
++  0.000  $ date
++  1.500  Mon Nov 10 16:32:06 UTC 2026
++  1.750  $
+```
+
+With `--start NAME=TIME` (repeatable) each line also gets the time of day,
+which lets you line the session up with device logs. mender-connect's
+"starting shell" journal line is a good source for the start time. Offsets
+add up the pauses the recording stored, so they are approximate.
+
+It reads both formats the Mender UI has produced: current exports, and older
+ones that store each chunk as a serialized Node Buffer. Output is decoded as
+UTF-8 across chunk boundaries, so characters split between chunks come out
+whole and invalid bytes don't stop it.
+
+Rendering is a minimal terminal. Colours, window titles and other escape codes
+are dropped. Carriage returns, backspace, tabs, and the cursor and
+line-editing codes bash uses are applied, so an edited command line (typos
+rubbed out, a command recalled from history and changed) comes out as it
+finally was when Enter was pressed. Full-screen programs such as `top` or `vi`
+don't render usefully.
+
+The output contains whatever was on the terminal, including anything secret
+that was typed or printed during the session. Treat it like the session
+itself before sharing it.
+
+Uses only the Python standard library.
